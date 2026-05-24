@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multipart
+pydantic-settings
+qdrant-client
+sentence-transformers
+PyMuPDF
+python-docx

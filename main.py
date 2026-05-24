@@ -7,14 +7,20 @@ from src.core import ChatRequest
 from langchain_core.messages import AIMessage, HumanMessage
 agent_manager = AgentManager()
 from datetime import datetime, date
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import uuid
 import argparse
+from typing import List
 import json
 import sys
 from src.utils.loggers import logger, timeit
+from uploadfile_vectordb.app.config import settings
+from uploadfile_vectordb.app.dtos import DeleteResponse, DocumentInfo, UploadResponse
+from uploadfile_vectordb.app.embedder import embed_texts
+from uploadfile_vectordb.app.parser import parse_document
+from uploadfile_vectordb.app.vectordb import delete_document, ensure_collection, get_client, list_documents, upsert_chunks
 
 
 def agent_chat(request: ChatRequest):
@@ -111,6 +117,70 @@ def redis_flushdb():
         return {"status": "failure", "error": str(e)}
 
 app.include_router(prefix_router)
+
+
+docs_router = APIRouter(prefix="/api/v1/docassistagent")
+
+
+@docs_router.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@docs_router.post("/upload", response_model=UploadResponse)
+async def upload_file(file: UploadFile = File(...)):
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    try:
+        chunks, doc_meta = parse_document(
+            content,
+            file.filename,
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=415, detail=str(exc))
+
+    if not chunks:
+        raise HTTPException(status_code=422, detail="No text could be extracted from the document")
+
+    document_id = str(uuid.uuid4())
+    embeddings = embed_texts([c["text"] for c in chunks], settings.embedding_model)
+
+    client = get_client(settings.qdrant_url)
+    ensure_collection(client, settings.collection_name, vector_size=len(embeddings[0]))
+    upsert_chunks(client, settings.collection_name, chunks, embeddings, document_id, doc_meta, file.filename)
+
+    return UploadResponse(
+        document_id=document_id,
+        file_name=file.filename,
+        file_type=doc_meta["file_type"],
+        total_chunks=doc_meta["total_chunks"],
+        total_pages=doc_meta["total_pages"],
+        author=doc_meta.get("author"),
+        title=doc_meta.get("title"),
+        message="Document indexed successfully",
+    )
+
+
+@docs_router.get("/documents", response_model=List[DocumentInfo])
+def get_documents():
+    client = get_client(settings.qdrant_url)
+    try:
+        return [DocumentInfo(**d) for d in list_documents(client, settings.collection_name)]
+    except Exception:
+        return []
+
+
+@docs_router.delete("/documents/{document_id}", response_model=DeleteResponse)
+def remove_document(document_id: str):
+    client = get_client(settings.qdrant_url)
+    delete_document(client, settings.collection_name, document_id)
+    return DeleteResponse(document_id=document_id, message="Document deleted successfully")
+
+app.include_router(docs_router)
 
 
 import shutil
